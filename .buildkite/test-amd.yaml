@@ -1436,6 +1436,7 @@ steps:
   - tests/models/minimax_m3/test_index_cache_overrides.py
   - tests/models/minimax_m3/test_dspark_drafter.py
   - tests/kernels/models/amd/test_minimax_m3_fused_markov.py
+  - tests/kernels/test_minimax_m3_dspark_draft.py
   - vllm/model_executor/models/config.py
   - vllm/platforms/rocm.py
   commands:
@@ -1443,6 +1444,7 @@ steps:
   - pytest -v -s models/minimax_m3/test_index_cache_overrides.py
   - pytest -v -s models/minimax_m3/test_dspark_drafter.py
   - pytest -v -s kernels/models/amd/test_minimax_m3_fused_markov.py
+  - pytest -v -s kernels/test_minimax_m3_dspark_draft.py
   # the long TP4 hand-off stress
   - pytest -v -s --optional -m optional models/minimax_m3/amd_specialized_decode
 
