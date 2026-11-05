@@ -186,10 +186,12 @@ steps:
   - tests/models/minimax_m3/amd_specialized_decode/
   - tests/models/minimax_m3/test_dspark_drafter.py
   - tests/kernels/models/amd/test_minimax_m3_fused_markov.py
+  - tests/kernels/test_minimax_m3_dspark_draft.py
   commands:
   - pytest -v -s models/minimax_m3/amd_specialized_decode
   - pytest -v -s models/minimax_m3/test_dspark_drafter.py
   - pytest -v -s kernels/models/amd/test_minimax_m3_fused_markov.py
+  - pytest -v -s kernels/test_minimax_m3_dspark_draft.py
 
 - label: ":nvidia: (B200) Inkling"
   key: inkling-unit-tests-b200
