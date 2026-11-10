@@ -17,6 +17,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -102,6 +103,8 @@ from vllm.model_executor.models.utils import (
     spec_decode_needs_target_embed,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
+from vllm.models.minimax_m3.amd.glue import M3Glue
+from vllm.models.minimax_m3.amd.glue.sp import SpCarry
 from vllm.models.minimax_m3.amd.indexer_msa import (
     MiniMaxM3IndexerMSAImpl,
     MiniMaxM3MSAIndexer,
@@ -158,6 +161,7 @@ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
 )
+from vllm.v1.worker.ubatching import dbo_enabled
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -863,6 +867,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # One fused kernel inserts both caches, so NVFP4 K/V needs an NVFP4
         # index cache.
         self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
+        # (codes [rows, q_size] e4m3, scales [rows, q_size / 32] uint8), shared by
+        # every layer: set by the model when the NVFP4 decode attend can write
+        # o_proj's MXFP8 input itself (``_attn_mxfp8_out``), else None.
+        self.o_proj_mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None
         # Indexer and main attention are separate impls. This indexer is
         # ROCm-only, so the model selects it rather than the neutral
         # MiniMaxM3Indexer, which knows nothing about it and would pick its own.
@@ -1258,8 +1266,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
             output = torch.empty_like(q)
             attn_output = self._run_attention(
-                q, None if self.skip_index_topk else index_q, output
+                q,
+                None if self.skip_index_topk else index_q,
+                output,
+                quant_out=self._o_proj_quant_out(num_tokens),
             )
+            if isinstance(attn_output, tuple):
+                # Decode-only step: the attend wrote o_proj's MXFP8 input.
+                x_q, x_scale = attn_output
+                attn_output = QuantizedActivation(
+                    x_q, x_scale, q.dtype, x_q.shape, kMxfp8Dynamic
+                )
             output, _ = self.o_proj(attn_output)
             return output
         q = qkv.new_empty((num_tokens, self.q_size))
@@ -1462,12 +1479,33 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         return output
 
     @eager_break_during_capture
+    def _o_proj_quant_out(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The MXFP8 buffers the NVFP4 decode attend may write o_proj's input
+        into at this token count, else None (the attend then writes bf16 and
+        o_proj quantizes it). The attend still falls back to bf16 on mixed or
+        prefill steps. Not at a width where o_proj's kernel quantizes inside
+        the GEMM (already one launch, and a different GEMM tile), nor under
+        DBO micro-batches (the buffers are shared by the layers)."""
+        buf = self.o_proj_mxfp8_out
+        if buf is None or not 0 < num_tokens <= buf[0].shape[0] or dbo_enabled():
+            return None
+        n, k = self.o_proj.weight.shape
+        if (
+            num_tokens <= _FUSED_QUANT_MAX_M
+            and _select_fused_quant_cfg(num_tokens, n, k) is not None
+        ):
+            return None
+        return buf[0][:num_tokens], buf[1][:num_tokens]
+
     def _run_attention(
         self,
         query: torch.Tensor,
         index_query: torch.Tensor | None,
         output: torch.Tensor,
-    ) -> torch.Tensor:
+        quant_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Single eager break around both: their split-K kernels read per-request
         # metadata and can't be captured into a cudagraph. The indexer writes its
         # top-k into the shared ``topk_indices_buffer``; the attend reads it back.
@@ -1535,7 +1573,52 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 output,
                 decode_sparse_table=decode_sparse_table,
             )
+        if quant_out is not None:
+            return self.impl.forward(
+                self, query, self.kv_cache, output, quant_out=quant_out
+            )
         return self.impl.forward(self, query, self.kv_cache, output)
+
+
+def _attn_mxfp8_out(
+    vllm_config: VllmConfig, layers: Iterable[nn.Module]
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Hand the NVFP4 sparse layers whose o_proj reads row-major MXFP8 (the
+    input norm's ``_can_fuse_input_norm_mxfp8`` test) one shared pair of MXFP8
+    buffers for their decode attend's output, sized for the widest decode step;
+    returns the pair, or None when no layer qualifies or
+    VLLM_M3_ATTN_MXFP8_OUT=0."""
+    if os.environ.get("VLLM_M3_ATTN_MXFP8_OUT", "1") == "0":
+        return None
+    attns = [
+        layer.self_attn
+        for layer in layers
+        if isinstance(getattr(layer, "self_attn", None), MiniMaxM3SparseAttention)
+        and layer.self_attn.use_nvfp4_kv
+        and not layer.self_attn.use_aiter_sparse_pa
+        and _can_fuse_input_norm_mxfp8(layer.self_attn.o_proj)
+    ]
+    if not attns:
+        return None
+    spec = vllm_config.speculative_config
+    spec_tokens = (spec.num_speculative_tokens or 0) if spec is not None else 0
+    sched = vllm_config.scheduler_config
+    rows = min(sched.max_num_batched_tokens, sched.max_num_seqs * (1 + spec_tokens))
+    k = attns[0].q_size
+    assert all(a.q_size == k for a in attns) and k % 32 == 0
+    buf = (
+        torch.empty(rows, k, dtype=torch.float8_e4m3fn),
+        torch.empty(rows, k // 32, dtype=torch.uint8),
+    )
+    for a in attns:
+        a.o_proj_mxfp8_out = buf
+    logger.info_once(
+        "MiniMax-M3 NVFP4 sparse decode writes o_proj's MXFP8 input "
+        "(%d layers, up to %d decode rows)",
+        len(attns),
+        rows,
+    )
+    return buf
 
 
 def _can_fuse_input_norm_mxfp8(qkv_proj: nn.Module) -> bool:
@@ -1557,6 +1640,9 @@ def _can_fuse_input_norm_mxfp8(qkv_proj: nn.Module) -> bool:
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
+    # set on the backbone's MoE layers when a glue path is on (glue/runtime.py)
+    _m3_glue: M3Glue | None = None
+
     def __init__(
         self,
         config: PreTrainedConfig,
@@ -1656,7 +1742,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         attn_input: torch.Tensor | QuantizedActivation
-        if residual is None:
+        if isinstance(hidden_states, SpCarry):
+            # SP prefill: the previous layer already ran this layer's input norm + MXFP8 quant on its rows and
+            # gathered the codes; the residual stays sharded (this rank's rows)
+            attn_input = QuantizedActivation(
+                hidden_states.x_q, hidden_states.x_s, torch.bfloat16, hidden_states.x_q.shape, kMxfp8Dynamic
+            )
+            residual = hidden_states.res_local
+        elif residual is None:
             residual = hidden_states
             attn_input = self.input_layernorm(hidden_states)
         elif self.fuse_input_norm_mxfp8:
@@ -1675,6 +1768,13 @@ class MiniMaxM3DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=attn_input,
         )
+
+        # decode glue / SP prefill: the whole MoE half from the o_proj partial,
+        # when this forward's plan selected one (glue/runtime.py)
+        if self._m3_glue is not None:
+            glued = self._m3_glue.moe_half(self, hidden_states, residual)
+            if glued is not None:
+                return glued
 
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         if self.fuse_post_norm_mxfp8:
@@ -1846,6 +1946,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             MiniMaxM3MoE,
             enable_eplb=vllm_config.parallel_config.enable_eplb,
         )
+        self.attn_mxfp8_out = _attn_mxfp8_out(
+            vllm_config, self.layers[self.start_layer : self.end_layer]
+        )
 
         if get_pp_group().is_last_rank:
             self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1861,6 +1964,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             from vllm.models.minimax_m3.amd.mono.dispatch import MonoDecode
 
             self._mono = MonoDecode(self, vllm_config)
+        # VLLM_M3_DECODE_GLUE / VLLM_M3_SP_PREFILL (glue/): None when both are off
+        self.m3_glue = M3Glue.create(self, vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1903,27 +2008,38 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 aux_hidden_states, self.start_layer, hidden_states, residual
             )
         layers = self.layers[self.start_layer : self.end_layer]
-        if decode is None:
-            for idx, layer in enumerate(layers, start=self.start_layer):
-                hidden_states, residual = layer(positions, hidden_states, residual)
-                self._maybe_add_hidden_state(
-                    aux_hidden_states, idx + 1, hidden_states, residual
-                )
-        else:
-            step = decode.plan(positions, intermediate_tensors)
-            failure: Exception | None = None
-            try:
+        # one glue plan for the whole forward (the MoE layers read it)
+        glue = self.m3_glue
+        plan = (
+            glue.begin_forward(positions, intermediate_tensors)
+            if glue is not None
+            else None
+        )
+        try:
+            if decode is None:
                 for idx, layer in enumerate(layers, start=self.start_layer):
-                    kernel = step.layer(layer.layer_id) if step else None
-                    hidden_states, residual = (kernel or layer)(
-                        positions, hidden_states, residual
-                    )
+                    hidden_states, residual = layer(positions, hidden_states, residual)
                     self._maybe_add_hidden_state(
                         aux_hidden_states, idx + 1, hidden_states, residual
                     )
-            except Exception as err:
-                failure = err
-            decode.after_step(step, failure)
+            else:
+                step = decode.plan(positions, intermediate_tensors)
+                failure: Exception | None = None
+                try:
+                    for idx, layer in enumerate(layers, start=self.start_layer):
+                        kernel = step.layer(layer.layer_id) if step else None
+                        hidden_states, residual = (kernel or layer)(
+                            positions, hidden_states, residual
+                        )
+                        self._maybe_add_hidden_state(
+                            aux_hidden_states, idx + 1, hidden_states, residual
+                        )
+                except Exception as err:
+                    failure = err
+                decode.after_step(step, failure)
+        finally:
+            if glue is not None:
+                glue.end_forward(plan)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -2068,6 +2184,10 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                     )
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
+        if self.m3_glue is not None:
+            # derived shared-expert weights, decode peer buffer and kernels
+            # (collective, every TP rank, outside graph capture)
+            self.m3_glue.after_load_weights()
         return loaded_params
 
 

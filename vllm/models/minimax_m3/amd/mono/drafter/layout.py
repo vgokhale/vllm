@@ -39,10 +39,26 @@ NATT = 48
 NORM0 = 240
 NP = 34  # partitions: a request's window spans <= 34 blocks
 MAXB = 34
-# requests a draft step takes, in launches of up to 8: 1..2 run the narrow
-# kernel, 3..8 the wide one. A FULL graph replay pads 9 requests to 10; the
-# kernels treat a padded request (seq_len 0) as one with no keys.
-MAX_REQS = 10
+# m31 overlay (drafter_wide): draft steps of 9..WIDE_R_MAX_REQS requests run as
+# one ``wide_r`` launch (VLLM_M3_DRAFTER_WIDE_R=1, the default); with
+# VLLM_M3_DRAFTER_WIDE_R=0 they run as launches of <= 8 requests (1..2 on the
+# narrow kernel, 3..8 on the wide one), as before. MAX_REQS gates which steps
+# reach the kernels at all (VLLM_M3_DRAFTER_MAX_REQS; default 32 with wide-R on,
+# 24 off). A FULL graph replay may pad the request count; the kernels treat a
+# padded request (seq_len 0) as one with no keys.
+WIDE_R = __import__("os").environ.get("VLLM_M3_DRAFTER_WIDE_R", "1") == "1"
+WIDE_R_MAX_REQS = int(
+    __import__("os").environ.get("VLLM_M3_DRAFTER_WIDE_R_MAX_REQS", "32")
+)
+# the wide-R kernel's attention split (wide_r.build_wide_r): "chunk" (outputs bitwise
+# the multi-launch path's for requests in chunks of 3..8) or "even" (more, shorter
+# partitions)
+WIDE_R_SPLIT = __import__("os").environ.get("VLLM_M3_DRAFTER_WIDE_R_SPLIT", "chunk")
+MAX_REQS = int(
+    __import__("os").environ.get(
+        "VLLM_M3_DRAFTER_MAX_REQS", str(WIDE_R_MAX_REQS if WIDE_R else 24)
+    )
+)
 
 QKV_R = 12
 O_R = 32

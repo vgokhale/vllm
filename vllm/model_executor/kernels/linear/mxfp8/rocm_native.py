@@ -11,6 +11,9 @@ BF16 once at load and served by a plain linear instead, since ``can_implement``
 does not filter on K.
 """
 
+import json
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -42,6 +45,48 @@ from .rocm_block32_gemm import (
 
 _FP8_MAX = float(torch.finfo(MXFP8_VALUE_DTYPE).max)
 _TINY = float(torch.finfo(torch.float32).tiny)
+
+# MiniMax-M3 overlay: AITER's FlyDSL gemm_a8w8_mxfp8_bpreshuffle for the (N, K) / M ranges where it beats this
+# Triton GEMM (VLLM_M3_AITER_MXFP8_RANGES: JSON {"N,K": [[lo, hi], ...]}, from linear_aiter/bench_linear.py). Those
+# layers keep a (16, 16)-preshuffled copy of the weight; scales and activations are shared with the Triton path.
+# Read once at import: torch.compile'd callers (the DSpark drafter) must not trace a file read; they keep the Triton
+# GEMM (is_compiling below), so the M-dependent choice never becomes a guard on a dynamic size.
+_AITER_LINEAR = os.environ.get("VLLM_M3_AITER_MXFP8_LINEAR", "0") == "1"
+_AITER_RANGES_FILE = os.environ.get("VLLM_M3_AITER_MXFP8_RANGES", "")
+_aiter_mod = None
+
+
+def _load_aiter_ranges() -> dict[tuple[int, int], tuple[tuple[int, int], ...]]:
+    if not (_AITER_LINEAR and _AITER_RANGES_FILE):
+        return {}
+    with open(_AITER_RANGES_FILE) as f:
+        raw = json.load(f)
+    return {
+        tuple(int(v) for v in key.split(",")): tuple((int(lo), int(hi)) for lo, hi in rs)
+        for key, rs in raw.items()
+    }
+
+
+_AITER_RANGES = _load_aiter_ranges()
+
+
+def _aiter_serves(layer: torch.nn.Module, m: int) -> bool:
+    if torch.compiler.is_compiling() or getattr(layer, "aiter_weight", None) is None:
+        return False
+    n, k = layer.weight.shape
+    return any(lo <= m <= hi for lo, hi in _AITER_RANGES.get((n, k), ()))
+
+
+def _aiter_gemm(x_q, x_scale, layer, out_dtype):
+    global _aiter_mod
+    if _aiter_mod is None:
+        import aiter
+
+        _aiter_mod = aiter
+    e8 = _aiter_mod.dtypes.fp8_e8m0
+    return _aiter_mod.gemm_a8w8_mxfp8_bpreshuffle(
+        x_q, layer.aiter_weight, x_scale.view(e8), layer.weight_scale.view(e8), out_dtype
+    )
 
 
 @triton.jit
@@ -482,6 +527,15 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
             weight = dequant_mxfp8_to_bf16(weight.contiguous(), weight_scale)
         replace_parameter(layer, "weight", weight.contiguous())
         replace_parameter(layer, "weight_scale", weight_scale)
+        if (
+            block_scale is None
+            and layer.weight.element_size() == 1
+            and K % _DOT_SCALED_K_ALIGN == 0
+            and (N, K) in _AITER_RANGES
+        ):
+            from aiter.ops.shuffle import shuffle_weight
+
+            layer.aiter_weight = shuffle_weight(layer.weight.data, layout=(16, 16))
 
     def input_quant_key(self) -> QuantKey:
         # Row-major [M, K // 32] E8M0 scales, unlike FlashInfer's swizzled ones
@@ -540,13 +594,20 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
                     x2d, layer.weight, layer.weight_scale, out_dtype
                 )
         elif qa is not None:
-            out = _mxfp8_dot_scaled_gemm(
-                x_q, x_scale, layer.weight, layer.weight_scale, out_dtype
-            )
+            if _aiter_serves(layer, x_q.shape[0]):
+                out = _aiter_gemm(x_q, x_scale, layer, out_dtype)
+            else:
+                out = _mxfp8_dot_scaled_gemm(
+                    x_q, x_scale, layer.weight, layer.weight_scale, out_dtype
+                )
         elif layer.weight.element_size() >= 2:
             out = torch.nn.functional.linear(x2d, layer.weight.to(out_dtype))
         elif x2d.shape[-1] % _DOT_SCALED_K_ALIGN == 0:
-            out = _mxfp8_dot_scaled_linear(x2d, layer.weight, layer.weight_scale)
+            if x2d.shape[0] > _FUSED_QUANT_MAX_M and _aiter_serves(layer, x2d.shape[0]):
+                x_q, x_scale = mxfp8_e4m3_quantize(x2d)
+                out = _aiter_gemm(x_q, x_scale, layer, out_dtype)
+            else:
+                out = _mxfp8_dot_scaled_linear(x2d, layer.weight, layer.weight_scale)
         else:
             # process_weights_after_loading dequantizes these weights once, so
             # this runs only if it did not; dot_scaled would be invalid here.

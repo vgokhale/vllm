@@ -112,7 +112,13 @@ class MiniMaxM3SparseRocmNvfp4Impl(MiniMaxM3SparseImpl):
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         output: torch.Tensor,
-    ) -> torch.Tensor:
+        quant_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Attend into ``output`` (bf16), or, given ``quant_out`` (e4m3 codes
+        [tokens, H x 128], e8m0 scales [tokens, H x 4]) and a decode-only step
+        covering every query row, into those as the MXFP8 quantization of the
+        bf16 result (bit-exact with ``mxfp8_e4m3_quantize``); returns the
+        tensors written."""
         from vllm.models.minimax_m3.amd.ops.nvfp4_prefill.host import (
             minimax_m3_nvfp4_sparse_prefill,
         )
@@ -135,6 +141,15 @@ class MiniMaxM3SparseRocmNvfp4Impl(MiniMaxM3SparseImpl):
         k_scale = layer._k_scale  # type: ignore[attr-defined]
         v_scale = layer._v_scale  # type: ignore[attr-defined]
 
+        # MXFP8 epilogue on decode-only steps whose rows are all the layer's
+        # rows (mixed steps keep bf16: the prefill attend writes bf16 rows).
+        fuse_q = (
+            quant_out is not None
+            and md.num_prefills == 0
+            and md.num_decodes > 0
+            and nd == query.shape[0]
+            and quant_out[0].shape[0] == nd
+        )
         if md.num_decodes > 0:
             d = md.decode
             assert d is not None
@@ -145,11 +160,15 @@ class MiniMaxM3SparseRocmNvfp4Impl(MiniMaxM3SparseImpl):
                 d.block_table,
                 d.seq_lens,
                 self.scale,
-                out[:nd],
+                None if fuse_q else out[:nd],
                 k_scale=k_scale,
                 v_scale=v_scale,
                 decode_query_len=d.decode_query_len,
+                out_q=quant_out[0] if fuse_q else None,
+                out_scale=quant_out[1] if fuse_q else None,
             )
+            if fuse_q:
+                return quant_out
         if md.num_prefills > 0:
             p = md.prefill
             assert p is not None

@@ -14,6 +14,12 @@ and widened to bf16; scores and softmax are fp32, P is bf16. Wave w owns keys
 The waves combine through LDS. With ``splits`` > 1 every split stores its
 unnormalized partial and the last split of a row to arrive combines them in
 split order, so the result does not depend on arrival order.
+
+The ``quant`` variant writes the o_proj input as MXFP8 instead of bf16: lane
+(n, g) of the combining wave holds dims [32 g, 32 g + 32) of head n, exactly
+one 32-wide MX block of the [rows, H x 128] activation, so the quant is
+lane-local (``mxfp8_quant32``), bit-exact with ``mxfp8_e4m3_quantize`` of the
+bf16 output.
 """
 
 import flydsl.compiler as flyc
@@ -54,6 +60,12 @@ from vllm.models.minimax_m3.amd.ops.nvfp4_prefill.kernel import (
 )
 
 PART_F = 36  # fp32 per (split, row, lane) partial: O (NDT x 4), max, sum, pad
+MX_BLOCK = 32  # MXFP8 block width (one lane's dims of one head)
+# Row placements of the XCD-aware grid (``xcds`` > 0).
+PLACE_REQ = 0  # request r on XCD r % xcds
+# whole groups of xcds requests as PLACE_REQ, the remaining rows in equal
+# contiguous runs (every XCD within one row of the others)
+PLACE_BAL = 1
 SIGN4 = 0x80808080 - (1 << 32)
 MAG4 = 0x07070707
 
@@ -138,22 +150,83 @@ def _global_atomic_add(addr_i64, value):
     )
 
 
-def compile_nvfp4_sparse_decode(splits: int = 1, topk: int = 16, xcds: int = 0):
+def mxfp8_quant32(words):
+    """One MX block of 32 bf16 (16 dwords, the low half the lower dim) ->
+    (8 dwords of e4m3 codes in dim order, e8m0 scale as i32).
+
+    ``_mxfp8_quant_triton_kernel``'s math on exact bf16 inputs: amax = max |x|
+    (at least FLT_MIN), sb = clamp(ceil(log2(amax / 448)) + 127, 0, 254),
+    q = e4m3_rne(x * 2^(127 - sb)). For a normal amax = 1.m x 2^e, amax / 448
+    = (1.m / 1.75) x 2^(e - 8) is a power of two only at 1.m = 1.75, so
+    ceil(log2) = e - 8 + (1.m > 1.75): from the bits, sb = biased exponent - 8
+    (+1 when the mantissa field exceeds 0x600000), clamped; FLT_MIN and the
+    subnormals give 0, inf 254. Every |x| x 2^(127 - sb) <= 448, so the
+    conversion never saturates.
+    """
+    ys = []
+    for w in words:
+        ys.append(as_f32(fx.Int32(w) << 16))
+        ys.append(as_f32(fx.Int32(w) & fx.Int32(-65536)))
+    amax = fx.Float32(0.0)
+    for y in ys:
+        amax = maxf_nn(amax, fx.Float32(fx.math.absf(y)))
+    ab = bits(amax)
+    e = (ab + fx.Int32(0x1FFFFF)).shrui(fx.Int32(23)) - fx.Int32(8)
+    e = (e > fx.Int32(0)).select(e, fx.Int32(0))
+    sb = (ab >= fx.Int32(0x7F800000)).select(fx.Int32(254), e)
+    rescale = as_f32((fx.Int32(254) - sb) << 23)
+    codes = []
+    for k in range_constexpr(8):
+        q = [ys[4 * k + i] * rescale for i in range_constexpr(4)]
+        lo = _fp8x2(q[0], q[1], fx.Int32(0), False)
+        codes.append(_fp8x2(q[2], q[3], lo, True))
+    return codes, sb
+
+
+def _fp8x2(a, b, old, hi):
+    """Two fp32 -> e4m3 (RNE) bytes 0, 1 (``hi``: 2, 3) of ``old``."""
+    return fx.Int32(
+        fx.rocdl.cvt_pk_fp8_f32(
+            T.i32,
+            fx.as_ir_value(fx.Float32(a)),
+            fx.as_ir_value(fx.Float32(b)),
+            fx.as_ir_value(fx.Int32(old)),
+            hi,
+        )
+    )
+
+
+def compile_nvfp4_sparse_decode(
+    splits: int = 1,
+    topk: int = 16,
+    xcds: int = 0,
+    place: int = PLACE_REQ,
+    quant: bool = False,
+):
     """Build the decode kernel.
 
     Args:
         splits: workgroups per (row, KV head), each over a contiguous share of
             the row's blocks.
         topk: top-k width (one lane per slot).
-        xcds: if > 0, workgroup w runs on XCD w % xcds and a request's rows and
-            a row's splits are placed on one XCD.
+        xcds: if > 0, workgroup w runs on XCD w % xcds and a row's splits are
+            placed on one XCD.
+        place: with ``xcds``, the rows' XCDs: ``PLACE_REQ`` puts request r on
+            XCD r % xcds; ``PLACE_BAL`` does that for whole groups of xcds
+            requests and spreads the remaining rows over the XCDs in
+            contiguous runs. Only moves rows between workgroups.
+        quant: write o_proj's MXFP8 input (``arg_xq`` codes, ``arg_xs``
+            scales) instead of the bf16 ``arg_out``.
 
     """
     assert 1 <= topk <= 64 and splits >= 1
-    SPLITS, TOPK, XCDS = splits, topk, xcds
+    assert place in (PLACE_REQ, PLACE_BAL) and (place == PLACE_REQ or xcds > 0)
+    SPLITS, TOPK, XCDS, PLACE, QUANT = splits, topk, xcds, place, quant
     # Split partials need sc1 unless all splits of a row run on one XCD.
     PART_SCOPE = 0 if XCDS else SC1
     name = f"m3_nvfp4_sparse_decode_k{TOPK}_s{SPLITS}" + (f"_x{XCDS}" if XCDS else "")
+    name += "b" if PLACE == PLACE_BAL else ""
+    name += "_mxfp8" if QUANT else ""
 
     @fx.struct
     class Shared:
@@ -184,6 +257,8 @@ def compile_nvfp4_sparse_decode(splits: int = 1, topk: int = 16, xcds: int = 0):
         i64_part_bytes: fx.Int64,
         i32_page_byte: fx.Int32,
         f32_c: fx.Float32,  # sm_scale * log2(e)
+        arg_xq: fx.Int64,  # quant: [rows, H x 128] e4m3 codes
+        arg_xs: fx.Int64,  # quant: [rows, H x 128 / 32] e8m0 scales
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek()
         tx = fx.thread_idx.x
@@ -204,11 +279,25 @@ def compile_nvfp4_sparse_decode(splits: int = 1, topk: int = 16, xcds: int = 0):
         smem.lut.ptr[tx] = fx.Int32(lut_g[tx])
         smem.lut.ptr[tx + 256] = fx.Int32(lut_g[tx + 256])
 
-        if const_expr(XCDS > 0):
+        if const_expr(XCDS > 0 and PLACE == PLACE_REQ):
             # grid.x is padded to XCDS x ql so a request's rows share an XCD.
             xcd = bx % XCDS
             slot = bx // XCDS
             row = ((slot // i32_ql) * XCDS + xcd) * i32_ql + slot % i32_ql
+        elif const_expr(XCDS > 0):
+            # The first (reqs // XCDS) x XCDS requests as above (sf slots an
+            # XCD); XCD x then takes the next sr rows from rows_full + x sr on.
+            # grid.x = (sf + sr) x XCDS; a slot past the rows is a padding row,
+            # and the map is a bijection onto [0, grid.x).
+            xcd = bx % XCDS
+            slot = bx // XCDS
+            sf = (i32_rows // i32_ql // XCDS) * i32_ql
+            rows_full = sf * XCDS
+            sr = (i32_rows - rows_full + (XCDS - 1)) // XCDS
+            row = (slot < sf).select(
+                ((slot // i32_ql) * XCDS + xcd) * i32_ql + slot % i32_ql,
+                rows_full + xcd * sr + (slot - sf),
+            )
         else:
             row = bx
         row_ok = row < i32_rows
@@ -383,20 +472,52 @@ def compile_nvfp4_sparse_decode(splits: int = 1, topk: int = 16, xcds: int = 0):
             results = yield [fx.as_ir_value(x) for x in state]
 
         def store_out(acc, inv):
-            outr = buffer_ops.create_buffer_resource_from_addr(
-                arg_out,
-                num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2),
-            )
-            o_row = (row * i32_H + kvh * HG + n) * (D // 2) + g * 16
-            for e in range_constexpr(4):
-                val = Vec.from_elements(
-                    [
-                        pk_bf16(acc[2 * j][e] * inv, acc[2 * j + 1][e] * inv)
-                        for j in range_constexpr(4)
-                    ],
-                    fx.Int32,
+            # Dword (e, j) = bf16 dims 32 g + 8 e + 2 j, + 1 of head n.
+            words = [
+                [
+                    pk_bf16(acc[2 * j][e] * inv, acc[2 * j + 1][e] * inv)
+                    for j in range_constexpr(4)
+                ]
+                for e in range_constexpr(4)
+            ]
+            if const_expr(QUANT):
+                # One MX block a lane: codes dims [32 g, 32 g + 32) of head
+                # kvh x HG + n, scale byte (kvh x HG + n) x 4 + g of the row.
+                codes, sb = mxfp8_quant32([w for ws in words for w in ws])
+                head = row * i32_H + kvh * HG + n
+                qr = buffer_ops.create_buffer_resource_from_addr(
+                    arg_xq, num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * D
                 )
-                buffer_ops.buffer_store(val, outr, o_row + e * 4, mask=row < i32_rows)
+                for h in range_constexpr(2):
+                    buffer_ops.buffer_store(
+                        Vec.from_elements(codes[4 * h : 4 * h + 4], fx.Int32),
+                        qr,
+                        head * (D // 4) + g * (MX_BLOCK // 4) + 4 * h,
+                        mask=row < i32_rows,
+                    )
+                sr_ = buffer_ops.create_buffer_resource_from_addr(
+                    arg_xs,
+                    num_records_bytes=fx.Int64(i32_rows)
+                    * fx.Int64(i32_H)
+                    * (D // MX_BLOCK),
+                )
+                buffer_ops.buffer_store(
+                    sb.to(fx.Int8).ir_value(),
+                    sr_,
+                    head * (D // MX_BLOCK) + g,
+                    mask=row < i32_rows,
+                )
+            else:
+                outr = buffer_ops.create_buffer_resource_from_addr(
+                    arg_out,
+                    num_records_bytes=fx.Int64(i32_rows) * fx.Int64(i32_H) * (D * 2),
+                )
+                o_row = (row * i32_H + kvh * HG + n) * (D // 2) + g * 16
+                for e in range_constexpr(4):
+                    val = Vec.from_elements(words[e], fx.Int32)
+                    buffer_ops.buffer_store(
+                        val, outr, o_row + e * 4, mask=row < i32_rows
+                    )
 
         # Combine the waves' partials in wave 0.
         o_lds = fx.logical_divide(
@@ -542,6 +663,8 @@ def compile_nvfp4_sparse_decode(splits: int = 1, topk: int = 16, xcds: int = 0):
         i32_page_b: fx.Int32,
         f32_c: fx.Float32,
         i32_grid_x: fx.Int32,
+        arg_xq: fx.Int64,
+        arg_xs: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(
@@ -565,6 +688,8 @@ def compile_nvfp4_sparse_decode(splits: int = 1, topk: int = 16, xcds: int = 0):
             i64_part_bytes,
             i32_page_b,
             f32_c,
+            arg_xq,
+            arg_xs,
         ).launch(
             grid=(i32_grid_x, i32_hkv, SPLITS),
             block=(64 * NW, 1, 1),
