@@ -470,14 +470,14 @@ def bf16x3_router_gemm_module():
 
 
 @cache
-def _aiter_gemm_a16w16x3():
-    """AITER's gemm_a16w16x3, or None when the installed AITER does not have it."""
+def _aiter_gemm_a16w32():
+    """AITER's gemm_a16w32, or None when the installed AITER does not have it."""
     try:
-        from aiter.ops.triton.gemm.basic.gemm_a16w16x3 import gemm_a16w16x3
+        from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32
     except ImportError:
         return None
-    logger.info_once("ROCm router GEMM: AITER gemm_a16w16x3 below 2048 tokens.")
-    return gemm_a16w16x3
+    logger.info_once("ROCm router GEMM: AITER gemm_a16w32 below 2048 tokens.")
+    return gemm_a16w32
 
 
 def rocm_bf16x3_router_gemm_dispatch_impl(
@@ -499,9 +499,9 @@ def rocm_bf16x3_router_gemm_dispatch_impl(
 
     if bf16x3_router_gemm_rocm.is_supported(x, weight):
         return bf16x3_router_gemm_rocm.bf16x3_router_gemm(x, weight_split)
-    # Below MIN_TOKENS: AITER's gemm_a16w16x3 (fp32 FMA at small M, bf16x3 MFMA
+    # Below MIN_TOKENS: AITER's gemm_a16w32 (fp32 FMA at small M, bf16x3 MFMA
     # above), one launch for every M.
-    aiter_gemm = _aiter_gemm_a16w16x3()
+    aiter_gemm = _aiter_gemm_a16w32()
     if (
         aiter_gemm is not None
         and x.shape[0] > 0
