@@ -88,7 +88,7 @@ class AiterMoe:
         from vllm.model_executor.layers.fused_moe.activation import MoEActivation
         from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
             AiterExperts,
-            QuantMethod,
+            AiterQuantType,
             _resolve_aiter_activation,
             aiter_moe_pads,
         )
@@ -98,7 +98,7 @@ class AiterMoe:
         fe = getattr(kernel, "fused_experts", None)
         if (
             not isinstance(fe, AiterExperts)
-            or fe._AITER_QUANT_METHOD != QuantMethod.BLOCK_1X32
+            or fe._AITER_QUANT_TYPE != AiterQuantType.BLOCK_1X32
         ):
             raise ValueError(f"routed experts run {type(fe).__name__}, not AITER MXFP4")
         if fe._extra_fused_moe_kwargs():
@@ -127,8 +127,18 @@ class AiterMoe:
             else mc.intermediate_pad
         )
         hidden_pad, inter_pad = aiter_moe_pads(
-            hidden_pad, inter_pad, routed.activation, qc.use_mxfp4_w4a4, mc.tp_size
+            hidden_pad,
+            inter_pad,
+            routed.activation,
+            qc.use_mxfp4_w4a4,
+            qc.use_mxfp4_w4a16,
+            mc.tp_size,
         )
+        if qc.use_mxfp4_w4a16:
+            # As rocm_aiter_fused_experts: AITER's bias-less W4A16 FlyDSL stage 1
+            # leaves the padded intermediate columns unwritten (ROCm/aiter#6598);
+            # the padded weights are zero, so no pad is declared.
+            inter_pad = 0
         return cls(
             w1=w1,
             w2=w2,
