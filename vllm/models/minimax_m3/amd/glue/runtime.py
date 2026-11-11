@@ -113,12 +113,8 @@ class M3Glue:
         for layer in self.layers:
             layer._m3_glue = self
         self.meta_key = getattr(self.layers[0].self_attn, "layer_name", None)
+        # (its epoch reset needs Model Runner V2, the only runner since #63373)
         self.want_decode = envs.DECODE_GLUE
-        if self.want_decode and not vllm_config.use_v2_model_runner:
-            logger.warning(
-                "MiniMax-M3 decode glue off: its epoch reset needs Model Runner V2"
-            )
-            self.want_decode = False
         bad = [s for s in envs.GLUE_WIDTHS if s % 4 or not 17 <= s <= 192]
         if self.want_decode and bad:
             raise ValueError(
