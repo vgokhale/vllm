@@ -15,7 +15,11 @@ ranks keep or drop the path together):
   from rank-uniform data only (forward context, attention metadata, row count,
   capture state); kept thread-locally for the decoder layers.
 * `moe_half` (MiniMaxM3DecoderLayer.forward, after attention): the layer's MoE
-  half on the planned path, or None for the stock path.
+  half on the planned path, or None for the stock path. When the next layer is
+  a MoE layer taking MXFP8 attention input, the all-reduce after the MoE hands
+  that layer its quantized input (an Mxfp8Carry): SP through the fused
+  reduce-scatter + MXFP8 gather, decode when the installed AITER has the fused
+  all-reduce + RMSNorm + MXFP8 quant.
 * `output_step` (MiniMaxM3ModelState.postprocess_state, every sampled step,
   eager or replayed): the periodic collective epoch reset."""
 
@@ -238,6 +242,7 @@ class M3Glue:
             glue.close()
             return
         self.decode = glue
+        glue.setup_post_moe()  # collective; agrees internally
         logger.info(
             "MiniMax-M3 decode glue ready: widths %s, shared expert %s",
             glue.widths,
@@ -377,13 +382,27 @@ class M3Glue:
                 layer, hidden_states, residual, sw, moe, self._next_norm(layer)
             )
         md, q = self._decode_row(plan.rows)  # same tuned row for every layer
-        return self.decode.run(layer, hidden_states, residual, sw, moe, md, q)
+        # a specialized decode kernel can take the next layer's place (it reads
+        # all-reduced rows)
+        special = getattr(self.model, "specialized_decode", None) is not None
+        return self.decode.run(
+            layer,
+            hidden_states,
+            residual,
+            sw,
+            moe,
+            md,
+            q,
+            None if special else self._next_norm(layer),
+        )
 
     def _next_norm(self, layer):
-        """SP: the next layer's input norm when the all-reduce after this MoE can
-        be a reduce-scatter + MXFP8 gather (the next layer is a MoE layer taking
-        MXFP8 attention input, and no drafter hidden state is taken between them:
-        those need full rows); else None (all-reduce)."""
+        """The next layer's input norm when the all-reduce after this MoE can
+        also norm and quantize that layer's attention input (SP: reduce-scatter +
+        MXFP8 gather; decode: AITER's fused all-reduce + norm + MXFP8): the next
+        layer is a MoE layer taking MXFP8 attention input, and no drafter hidden
+        state is taken between them (those need the all-reduced rows); else
+        None."""
         nid = layer.layer_id + 1
         layers = self.model.layers
         if nid >= len(layers) or nid in getattr(
@@ -414,6 +433,7 @@ class M3Glue:
         for phase, fn in (
             ("drain", torch.accelerator.synchronize),
             ("clear", self.decode.reset),
+            ("post-MoE clear", self.decode.reset_post_moe),
         ):
             ok, err = True, None
             try:
